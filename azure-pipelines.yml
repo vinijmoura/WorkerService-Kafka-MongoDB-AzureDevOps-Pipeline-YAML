@@ -1,0 +1,169 @@
+trigger:
+- main 
+
+resources:
+  containers:
+    - container: zookeeper
+      image: confluentinc/cp-zookeeper:latest
+      networks: 
+      - testes
+      env:
+        ZOOKEEPER_CLIENT_PORT: 2181
+        ZOOKEEPER_TICK_TIME: 2000
+      ports:
+        - 2181:2181 
+    - container: kafka
+      image: confluentinc/cp-kafka:latest
+      networks: 
+      - testes
+      depends_on:
+      - zookeeper
+      env:
+        KAFKA_BROKER_ID: 1
+        KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+        KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+        KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+        KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+        KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      ports:
+        - 9092:9092
+    - container: mongodb
+      image: mongo:latest
+      networks: 
+      - testes
+      env:
+        MONGO_INITDB_ROOT_USERNAME: root
+        MONGO_INITDB_ROOT_PASSWORD: MongoDB2021!
+      ports:
+        - 27017:27017
+
+variables:
+
+  # Container registry service connection established during pipeline creation
+  dockerRegistryServiceConnection: 'xxxxxxx-xxxxxxx-xxxx-xxxxxxxxxxx'
+  imageRepository: 'workeracrazdo'
+  containerRegistry: 'myacr.azurecr.io'
+  dockerfilePath: '**/Dockerfile'
+  tag: '$(Build.BuildId)'
+  imagePullSecret: 'myimage-auth'
+
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+
+  PATH_PROJETO: ./WorkerAcoes
+  PATH_PROJETO_TESTES: ./WorkerAcoes.IntegrationTests
+  FILE_LOG_EXECUCAO_WORKERACOES: log-execucao-workeracoes.txt
+  MongoDBConnection: mongodb://root:MongoDB2021!@localhost:27017
+  MongoDatabase: DBAcoesTestes
+  MongoCollection: HistoricoAcoesTestes
+  ApacheKafka__Broker: localhost:9092
+  ApacheKafka__Topic: topic-testes-acoes
+  ApacheKafka__GroupId: WorkerAcoesTestes
+
+stages:
+- stage: tests
+  displayName: tests .NET
+  jobs:
+  - job: tests
+    displayName: tests .NET
+    pool:
+      vmImage: $(vmImageName)
+    services:
+      zookeeper: zookeeper
+      kafka: kafka
+      mongodb: mongodb
+    steps:
+    - task: UseDotNet@2
+      displayName: Install .NET 5
+      inputs:
+        packageType: 'sdk'
+        version: '5.0.202'
+    - script: |
+        dotnet publish $(PATH_PROJETO) -c Release -o app
+        cd ./app
+        sleep 20s
+        nohup dotnet WorkerAcoes.dll > $(FILE_LOG_EXECUCAO_WORKERACOES) 2>&1 &
+      displayName: Executar a aplicação a ser testada em background (nohup)
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'test'
+        projects: '$(PATH_PROJETO_TESTES)'
+        arguments: '--verbosity minimal --logger:"html;LogFileName=resultado-testes.html"'
+      displayName: DotNet Test
+    - task: CopyFiles@2
+      inputs:
+        SourceFolder: './app'
+        Contents: '$(FILE_LOG_EXECUCAO_WORKERACOES)'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+      displayName: Upload como Artifact do Log de Execução do Worker de Ações
+      condition: always()
+    - task: CopyFiles@2
+      inputs:
+        SourceFolder: '$(Agent.TempDirectory)'
+        Contents: 'resultado-testes.html'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+      displayName: Upload como Artifact do Report de Testes
+      condition: always()
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'
+      condition: always()
+      displayName: Build Artifacts
+- stage: build_push_acr
+  displayName: build push acr stage
+  dependsOn: tests
+  jobs:
+  - job: build_push_acr
+    displayName: build push acr stage
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: Docker@2
+      displayName: Build and push an image to container registry
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePath)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+
+    - upload: manifests
+      artifact: manifests
+
+- stage: deployment_aks
+  displayName: deployment aks
+  dependsOn: build_push_acr
+
+  jobs:
+  - deployment: build_push_acr
+    displayName: deployment aks
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'WorkerServiceKafkaMongoDB.workeracoesazdo'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@0
+            displayName: Create imagePullSecret
+            inputs:
+              action: 'createSecret'
+              kubernetesServiceConnection: 'AKSClusterAZDO-workeracoesazdo'
+              namespace: 'workeracoesazdo'
+              secretType: 'dockerRegistry'
+              secretName: '$(imagePullSecret)'
+              dockerRegistryEndpoint: '$(dockerRegistryServiceConnection)'
+
+          - task: KubernetesManifest@0
+            displayName: Deploy to Kubernetes cluster
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'AKSClusterAZDO-workeracoesazdo'
+              namespace: 'workeracoesazdo'
+              manifests: '$(Pipeline.Workspace)/manifests/deployment.yml'
+              containers: '$(containerRegistry)/$(imageRepository):$(tag)'
+              imagePullSecrets: '$(imagePullSecret)'
+
